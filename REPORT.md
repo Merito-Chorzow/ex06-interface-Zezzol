@@ -1,40 +1,82 @@
-# Raport: Ćwiczenie 3 — Non-blocking I/O (Ring Buffer + Shell)
+# Raport: Ćwiczenie 1 — Interfejs sterujący urządzeniem (Protokół + Driver)
 
-## 1. Polityka Overflow
-W projekcie zastosowano politykę **Drop New** (odrzucanie nowych danych).
-Implementacja w `ringbuf.c`:
-- Gdy `rb_free(r) == 0`, funkcja `rb_put` zwraca 0 i inkrementuje licznik `dropped`.
-- Bufor nie nadpisuje starych danych (`tail` pozostaje bez zmian).
+### 1. Cel
+Zaprojektowanie i implementacja nieblokującego interfejsu sterującego opartego na własnym protokole binarnym (ramki), wraz z obsługą błędów transmisji, maszyną stanów (FSM) odbiornika oraz symulacją urządzenia wykonawczego.
 
-**Konsekwencje:**
-- Zaleta: Gwarantuje integralność komend, które już zostały przyjęte. Nie ma ryzyka, że przetworzymy "połowę" starej komendy sklejoną z nową.
-- Wada: W przypadku nagłego skoku danych (burst), tracimy najnowsze informacje (np. najnowsze pomiary czujnika), przetwarzając te nieaktualne.
+### 2. Specyfikacja Protokołu
 
-## 2. Testy funkcjonalne
-Przeprowadzono symulację w `main.c`:
+**Format ramki:**
+```text
+[ STX (1B) | LEN (1B) | CMD (1B) | PAYLOAD (0..N B) | CRC (1B) ]
 
-### A. Test echo
-Komenda: `echo hello world`
-Odpowiedź: `ECHO hello world`
-Wniosek: Bufor kołowy poprawnie przechowuje i odtwarza kolejność bajtów.
+STX: Stały bajt startu 0xAA.
 
-### B. Test przepełnienia (Burst)
-Wysłano serię 200 komend `noop\r\n` (łącznie ok. 1200 bajtów) do bufora o rozmiarze 128 bajtów.
+LEN: Długość pola Payload (0–60 bajtów).
 
-**Logi przed burstem:**
-adrian@localhost:~/github-classroom/Merito-Chorzow/ex05-io-c-Zezzol> ./build/app
-READY
-set=0.000 ticks=1 drop=0 broken=0
-OK set=0.420
-rx_free=126 tx_free=127 rx_count=1
-ECHO hello world
+CMD: Kod komendy.
 
-**Logi po burście:**
-set=0.420 ticks=41 drop=1073 broken=0
+CRC: Suma kontrolna XOR (liczona od pola LEN do końca PAYLOAD).
 
-**Analiza:**
-- Licznik `drop` wzrósł znacząco, co potwierdza działanie mechanizmu detekcji przepełnienia.
-- Licznik `broken` (złamane linie) wskazuje, że z powodu odrzucenia znaków końca linii (`\n`), parser skleił kilka komend w jedną, przekraczając rozmiar bufora wejściowego shella.
+Endianness: Little-Endian.
+```
 
-## 3. Wnioski
-Zastosowanie bufora kołowego pozwala na odbiór danych bez blokowania procesora. Przy zbyt wolnym przetwarzaniu (`shell_tick`) w stosunku do napływu danych (`shell_rx_bytes`), mechanizm `dropped` pozwala zdiagnozować wąskie gardło systemu.
+**Lista Komend:**
+| CMD ID | Nazwa     | Parametry (Payload)                       | Odpowiedź  | Opis                                        |
+|--------|-----------|-------------------------------------------|------------|---------------------------------------------|
+| 0x01   | SET SPEED | [uint8_t speed] (0-100)                   | ACK / NACK | Ustawia prędkość silnika.                   |
+| 0x02   | MODE      | [uint8_t mode] (0:OPEN, 1:CLOSED, 2:SAFE) | ACK / NACK | Zmienia tryb pracy.                         |
+| 0x03   | STOP      | Brak                                      | ACK        | Natychmiastowe przejście do SAFE i speed=0. |
+| 0x04   | GET STAT  | Brak                                      | STAT {...} | Pobiera telemetrię.                         |
+
+**Kody Odpowiedzi:**
+
+ACK (0x80): Operacja powiodła się.
+
+NACK (0x81): Błąd logiczny. Payload zawiera kod błędu:
+
+    0x03: NACK_PARAM (wartość poza zakresem).
+
+    0x04: NACK_LEN (niepoprawna długość ramki).
+
+STAT (0x82): Odpowiedź z danymi telemetrycznymi.
+
+### 3. Implementacja
+
+**Maszyna Stanów (FSM) Odbiornika:**
+Driver protokołu (proto.c) działa w oparciu o maszynę stanów, co pozwala na nieblokujące przetwarzanie bajt po bajcie:
+
+    RX_IDLE: Oczekiwanie na bajt STX (0xAA). Każdy inny bajt jest traktowany jako śmieć (rx_dropped).
+
+    RX_WAIT_LEN: Odbiór długości payloadu. Weryfikacja czy długość nie przekracza rozmiaru bufora.
+
+    RX_WAIT_CMD: Odbiór kodu rozkazu.
+
+    RX_PAYLOAD: Pobieranie danych (jeśli LEN > 0).
+
+    RX_WAIT_CRC: Weryfikacja sumy kontrolnej.
+
+**Driver Urządzenia:** 
+Symulator (driver.c) implementuje logikę biznesową: waliduje zakresy (np. czy speed <= 100), zmienia stan wewnętrzny urządzenia i generuje odpowiednie ramki zwrotne.
+
+### 4. Telemetria
+Statystyki końcowe po wykonaniu testów:
+
+    Valid Frames: 3 (Poprawne ramki SET i GET)
+
+    CRC Errors: 1 (Test celowego błędu)
+
+    RX Dropped: 0 (Brak śmieci na wejściu w symulacji idealnej)
+
+### 5. Wnioski
+
+**Odporność FSM:** 
+Maszyna stanów poprawnie synchronizuje się na początku ramki i resetuje w przypadku błędów (np. błędne CRC). Zapobiega to blokowaniu odbiornika w nieskończoność.
+
+**Obsługa błędów:** 
+Rozdzielenie błędów warstwy łącza (CRC -> odrzucenie) od błędów warstwy aplikacji (zły parametr -> NACK) pozwala na skuteczną diagnostykę problemów.
+
+**Sugestie rozwoju:**
+
+W obecnej wersji FSM nie posiada timeoutu między bajtami (inter-byte timeout). W przypadku urwania transmisji w połowie ramki, odbiornik "wisi" czekając na resztę danych. Należy dodać timer resetujący FSM do RX_IDLE po np. 5ms ciszy.
+
+Dodanie numeru sekwencyjnego (SEQ) do nagłówka pozwoliłoby na wykrywanie duplikatów ramek (np. gdy ACK zaginie, a nadawca ponowi wysyłkę).
