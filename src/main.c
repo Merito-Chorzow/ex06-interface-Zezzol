@@ -22,7 +22,7 @@ int main(void){
     for(int i=0;i<20;i++) shell_tick(&sh);
 
     // końcowy status
-    shell_rx_bytes(&sh, "get\r\n");
+    shell_rx_bytes(&sh, "\r\nget\r\n");
     for(int i=0;i<5;i++) shell_tick(&sh);
 
     return 0;
